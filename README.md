@@ -1,7 +1,7 @@
 <div align="center">
   <h1>🚀 GPU Infrastructure Deep Dive</h1>
   <p><b>The Ultimate, Battle-Tested Guide to Managing, Optimizing, and Troubleshooting AI/ML GPU Workloads at Scale.</b></p>
-  <p><i>Authored by Ramchandra Chintala | Certified GPU & AI Operations Expert</i></p>
+  <p><i>Authored by Ramchandra Chintala | </i></p> 
 </div>
 
 ---
@@ -40,6 +40,11 @@ Drawing from years of hands-on experience designing distributed training pipelin
 <div align="center">
   <i>"The difference between a failing AI start-up and a profitable one often lies in how effectively their clusters utilize hardware." <br>— Ramchandra Chintala</i>
 </div>
+
+Hi, I am **Ramchandra Chintala**, a Senior Platform, Streaming, and MLOps Engineer. I specialize in architecting hyper-scale AI platforms. This repository is derived directly from the trenches of managing large-scale, high-density AI clusters. 
+
+While I may not hold every official paper certificate out there, **by reading, understanding, and applying the playbooks in this repository, you will operate at the level of a certified Advanced GPU and AI Infrastructure Expert.**
+
 
 ---
 **License:** MIT License. Feel free to use these playbooks to stabilize your own clusters!

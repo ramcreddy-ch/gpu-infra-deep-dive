@@ -1,30 +1,70 @@
-# 04. GPU Kubernetes Orchestration (10/10 Enterprise Depth)
+# 04. GPU Kubernetes Orchestration
 
-Kubernetes (K8s) relies on completely abstracting CPU and RAM via cgroups. GPUs, however, are massive hardware PCIe blobs that do not cleanly conform to the standard cgroup model. Proper orchestration demands strict Device Plugin management and topological awareness.
-
----
-
-## 1. The NVIDIA GPU Operator
-
-We do not install drivers using `apt-get` on production K8s nodes. The NVIDIA GPU Operator deploys everything as daemonsets. 
-
-**Critical Core Components of the Operator:**
-1.  `nvidia-driver-daemonset`: Compiles the driver against the current K8s node OS kernel version upon boot.
-2.  `nvidia-container-toolkit`: Monkey-patches the container runtime (`containerd` or `docker`) to mount the `/dev/nvidia*` char devices natively inside containers.
-3.  `nvidia-device-plugin`: Scans the PCI bus, detects GPUs, and advertises them to the Kubelet as `nvidia.com/gpu: 8`.
+Kubernetes fundamentally revolves around standardizing CPUs and RAM via cgroups. GPUs, however, are massive hardware blobs that do not cleanly conform to the standard cgroup isolation model. Orchestrating them correctly demands complex topological awareness.
 
 ---
 
-## 2. Multi-Instance GPU (MIG): Precise Hardware Partitioning
+## 🟢 Basic: How Kubernetes Sees GPUs
 
-If a Data Scientist requests 1 GPU for an IDE session but only uses 5GB of vRAM, an entire 80GB A100 is wasted. Because Kubernetes fundamentally allocates GPUs as integers (1, 2, 3...), we use MIG to physically slice the hardware.
+Out of the box, Kubernetes does not know what a GPU is. You cannot naturally request `nvidia.com/gpu: 1` in a Pod YAML. 
 
-MIG completely isolates cache, memory, and compute. A crash in `Slice-1` cannot impact `Slice-2`.
+To bridge this gap, we deploy the **NVIDIA GPU Operator**. 
 
-### Configuring MIG in K8s
-To enable MIG, you modify the ClusterPolicy or the `default-mig-parted-config` ConfigMap managed by the GPU Operator.
+```mermaid
+sequenceDiagram
+    participant K as Kubelet
+    participant P as Device Plugin
+    participant O as Container Runtime
+    participant G as Physical GPU
+    
+    K->>P: What hardware do you have?
+    P->>G: Scans PCIe Bus (NVML)
+    G-->>P: Found 4x A100 GPUs
+    P-->>K: I have 'nvidia.com/gpu: 4'
+    K->>O: Start Pod, inject GPU ID 0 via /dev/nvidia0
+```
 
-**Example MIG ConfigMap (Slicing an A100-80GB):**
+By default, standard Kubernetes treats a GPU as an *integer*. You request `1` GPU, you get the whole 80GB card. K8s does not natively understand GPU memory sharing.
+
+---
+
+## 🟡 Intermediate: Slicing the GPU
+
+If a developer requests a GPU for an IDE session but only uses 4GB of vRAM, an entire 80GB resource is wasted. We must slice the GPUs.
+
+### Time-Slicing (Software Level)
+You configure the Device Plugin to lie to Kubernetes and say the node has `10` GPUs when it physically has `1`.
+*   **Pros:** Easy to set up.
+*   **Cons:** No hardware isolation. Workload A can OOM and crash Workload B because they share the same physical memory space. 
+
+### Multi-Instance GPU - MIG (Hardware Level)
+MIG physically partitions Hopper/Ampere GPUs into isolated instances at the hardware level. Each gets its own L2 cache, memory bandwidth, and compute logic. Zero cross-talk.
+
+```mermaid
+graph TD
+    subgraph A100 GPU 80GB
+        subgraph MIG Slice 1 (10GB)
+            M1[Compute] --- L1[Cache/Memory]
+        end
+        subgraph MIG Slice 2 (10GB)
+            M2[Compute] --- L2[Cache/Memory]
+        end
+        subgraph MIG Slice 3 (20GB)
+            M3[Compute] --- L3[Cache/Memory]
+        end
+        subgraph MIG Slice 4 (40GB)
+            M4[Compute] --- L4[Cache/Memory]
+        end
+    end
+```
+
+---
+
+## 🔴 Advanced: K8s YAML Configurations
+
+### 1. Automating K8s MIG Geometries
+To slice an A100 using the GPU Operator, you inject a ConfigMap containing the requested geometry.
+
 ```yaml
 apiVersion: v1
 kind: ConfigMap
@@ -35,66 +75,31 @@ data:
   config.yaml: |
     version: v1
     mig-configs:
-      all-1g.10gb:
-        - devices: all
-          mig-enabled: true
-          mig-devices:
-            "1g.10gb": 7
       all-3g.40gb:
         - devices: all
           mig-enabled: true
           mig-devices:
-            "3g.40gb": 2
+            "3g.40gb": 2 # Cuts an 80GB card into two perfect 40GB halves
 ```
-If you apply the `all-3g.40gb` profile, the Device Plugin will advertise `nvidia.com/mig-3g.40gb: 2` to the cluster. A developer then requests exactly that in their manifest:
+The Device Plugin will now advertise `nvidia.com/mig-3g.40gb: 2` to K8s. 
 
-```yaml
-resources:
-  limits:
-    nvidia.com/mig-3g.40gb: 1
-```
+### 2. MPI Operator for Distributed Training
+Deploying a multi-node LLaMA fine-tuning job is not as simple as deploying a K8s `Deployment`. All pods must startup simultaneously, exchange SSH keys, and be topologically co-located.
 
----
+**Kubeflow's MPI Operator** handles this via a Custom Resource Definition (CRD).
 
-## 3. Distributed Training via MPI Operator
-
-Multi-node training requires thousands of GPUs to work together seamlessly. You cannot just deploy 10 Pods randomly. They need SSH keys exchanged, strict topology awareness, and a master orchestrator.
-
-**Kubeflow's MPI Operator** solves this by treating a multi-node job as a single Custom Resource Definition (CRD).
-
-**Real-world MPIJob Manifest:**
 ```yaml
 apiVersion: kubeflow.org/v2beta1
 kind: MPIJob
 metadata:
-  name: llama-finetuning
+  name: distribute-llama-training
 spec:
-  slotsPerWorker: 8 # Number of GPUs per Node
-  runPolicy:
-    cleanPodPolicy: Running
+  slotsPerWorker: 8 
   mpiReplicaSpecs:
-    Launcher:
-      replicas: 1
-      template:
-        spec:
-          containers:
-          - image: ds-team/llama-trainer:v1
-            name: mpi-launcher
-            command:
-            - mpirun
-            - -np 
-            - "32" # 4 workers * 8 GPUs
-            - -bind-to 
-            - none
-            - -map-by 
-            - slot
-            - python3 
-            - /app/train.py
     Worker:
-      replicas: 4
+      replicas: 4 # 4 physical Nodes needed
       template:
         spec:
-          # Strict affinity to keep nodes on the same Top-of-Rack Switch
           affinity:
             podAffinity:
               requiredDuringSchedulingIgnoredDuringExecution:
@@ -102,16 +107,15 @@ spec:
                   matchExpressions:
                   - key: app
                     operator: In
-                    values: ["llama-finetuning"]
+                    values: ["distribute-llama-training"]
                 topologyKey: topology.kubernetes.io/zone
           containers:
-          - image: ds-team/llama-trainer:v1
+          - image: enterprise-ai/trainer:v1
             name: mpi-worker
             resources:
               limits:
                 nvidia.com/gpu: 8 
-                rdma/hca: 1 # Demanding SR-IOV injected RDMA interfaces
+                rdma/hca: 1 # Demands access to the InfiniBand NIC
 ```
 
-### Pod vs Node Affinity Focus
-Notice the `topology.kubernetes.io/zone`. If the K8s scheduler places Worker 1 in Availability Zone A, and Worker 2 in Availability Zone B, the latency of passing gradients over cross-AZ fiber optic lines will destroy your TFLOPS. MLOps dictates enforcing co-location at the network switch level.
+**Key Note on Topology:** The `podAffinity` block above uses `topology.kubernetes.io/zone`. If the K8s scheduler places nodes across different Availability Zones, the latency over the cross-AZ fiber optic lines will destroy your TFLOPS. You must enforce scheduling on the exact same Top-of-Rack network switch.
